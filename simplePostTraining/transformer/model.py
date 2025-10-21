@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from typing import Optional
 
 from .mha import MultiHeadSelfAttention
+from ..utils.sampling import sample_tokens
 
 
 class RMSNorm(nn.Module):
@@ -368,6 +369,48 @@ class Transformer(nn.Module):
 
         return logits
 
+    def get_hidden_states(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Get hidden states from transformer (without language modeling head).
+
+        Args:
+            input_ids: Token indices of shape (batch_size, seq_len)
+            attention_mask: Attention mask of shape (batch_size, seq_len)
+
+        Returns:
+            Hidden states of shape (batch_size, seq_len, d_model)
+        """
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+
+        # Token embeddings
+        x = self.token_embedding(
+            input_ids
+        )  # (batch_size, seq_len, d_model)
+
+        # Add positional encoding
+        if seq_len <= self.max_seq_len:
+            x = x + self.pos_encoding[:, :seq_len, :].to(
+                device
+            )
+        else:
+            raise ValueError(
+                f"Sequence length {seq_len} exceeds maximum {self.max_seq_len}"
+            )
+
+        # Apply transformer blocks
+        for block in self.blocks:
+            x = block(x, attention_mask)
+
+        # Final layer norm
+        x = self.norm(x)
+
+        return x
+
     def generate(
         self,
         input_ids: torch.Tensor,
@@ -453,11 +496,13 @@ class Transformer(nn.Module):
                         float("-inf")
                     )
 
-                # Sample next token
-                probs = F.softmax(next_token_logits, dim=-1)
-                next_token = torch.multinomial(
-                    probs, num_samples=1
-                )
+                # Sample next token using our sampling utilities
+                next_token = sample_tokens(
+                    next_token_logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                ).unsqueeze(-1)
 
                 # Append to input_ids
                 input_ids = torch.cat(
