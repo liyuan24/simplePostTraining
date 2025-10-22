@@ -2,6 +2,10 @@ import torch
 from typing import Optional
 from simplePostTraining.transformer import Transformer
 from simplePostTraining.utils.sampling import sample_tokens
+from simplePostTraining.ppo.utils import (
+    compute_kl,
+    compute_reward,
+)
 
 
 class PPOModel:
@@ -134,7 +138,7 @@ class PPOModel:
 
     def generate_rollout(
         self,
-        prompt_tokens: torch.Tensor,
+        prompt_tokens: list[torch.Tensor],
         max_response_length: int = 4,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
@@ -147,9 +151,10 @@ class PPOModel:
     ]:
         """
         Generate rollout sequences for PPO training starting from prompt tokens.
+        Processes sequences one by one for better memory efficiency.
 
         Args:
-            prompt_tokens: Starting prompt tokens of shape (batch_size, prompt_len)
+            prompt_tokens: List of prompt tensors, each of shape (prompt_len,)
             max_response_length: Maximum response length
             temperature: Sampling temperature
             top_k: Number of top tokens to consider (None = no filtering)
@@ -159,187 +164,199 @@ class PPOModel:
             Tuple of (sequences, log_probs, values, action_mask)
         """
         device = next(self.policy.parameters()).device
-        batch_size, prompt_len = prompt_tokens.shape
+        batch_size = len(prompt_tokens)
 
-        # Start with prompt tokens
-        sequences = prompt_tokens.clone()
+        # Store results for each sequence
+        all_sequences = []
+        all_log_probs = []
+        all_values = []
+        all_action_masks = []
 
-        # Track which sequences are still generating (not EOS)
-        active_mask = torch.ones(
-            batch_size, dtype=torch.bool, device=device
+        # Process each sequence individually
+        for i in range(batch_size):
+            prompt = prompt_tokens[i].unsqueeze(
+                0
+            )  # Add batch dimension
+
+            # Generate single sequence
+            sequence, log_probs, value, action_mask = (
+                self._generate_single_rollout(
+                    prompt,
+                    max_response_length,
+                    temperature,
+                    top_k,
+                    top_p,
+                )
+            )
+
+            all_sequences.append(
+                sequence.squeeze(0)
+            )  # Remove batch dimension
+            all_log_probs.append(
+                log_probs.squeeze(0)
+            )  # Remove batch dimension
+            all_values.append(
+                value.squeeze(0)
+            )  # Remove batch dimension
+            all_action_masks.append(
+                action_mask.squeeze(0)
+            )  # Remove batch dimension
+
+        # Find maximum sequence length for padding
+        max_seq_len = max(
+            seq.shape[0] for seq in all_sequences
         )
 
-        # Store log probabilities for each step
+        # Pad sequences to same length
+        padded_sequences = torch.zeros(
+            batch_size,
+            max_seq_len,
+            device=device,
+            dtype=torch.long,
+        )
+        padded_action_masks = torch.zeros(
+            batch_size,
+            max_seq_len,
+            device=device,
+            dtype=torch.int,
+        )
+        padded_log_probs = torch.zeros(
+            batch_size, max_seq_len, device=device
+        )
+        padded_values = torch.zeros(
+            batch_size, max_seq_len, device=device
+        )
+
+        for i in range(batch_size):
+            seq_len = all_sequences[i].shape[0]
+
+            padded_sequences[i, :seq_len] = all_sequences[i]
+            padded_action_masks[i, :seq_len] = (
+                all_action_masks[i]
+            )
+            padded_log_probs[i, :seq_len] = all_log_probs[i]
+            padded_values[i, :seq_len] = all_values[i]
+
+        return (
+            padded_sequences,
+            padded_log_probs,
+            padded_values,
+            padded_action_masks,
+        )
+
+    def _generate_single_rollout(
+        self,
+        prompt: torch.Tensor,  # Shape: (1, prompt_len)
+        max_response_length: int,
+        temperature: float,
+        top_k: Optional[int],
+        top_p: Optional[float],
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """
+        Generate rollout for a single sequence.
+
+        Args:
+            prompt: Single prompt of shape (1, prompt_len)
+            max_response_length: Maximum response length (excluding prompt)
+            temperature: Sampling temperature
+            top_k: Number of top tokens to consider
+            top_p: Cumulative probability threshold
+
+        Returns:
+            Tuple of (sequence, log_probs, value, action_mask)
+        """
+        device = prompt.device
+        prompt_len = prompt.shape[1]
+
+        # Start with prompt
+        sequence = prompt.clone()
         log_probs_list = []
 
-        # Generate sequences step by step
-        remaining_length = max_response_length
-        for step in range(remaining_length):
-            # Only generate for active sequences
-            if not active_mask.any():
+        # Generate response tokens one by one
+        for step in range(max_response_length):
+            # Get logits for current sequence
+            logits = self.get_logits(sequence)
+
+            # Sample next token
+            next_token = sample_tokens(
+                logits, temperature, top_k, top_p
+            )
+
+            # Calculate log probability
+            step_log_probs = torch.log_softmax(
+                logits, dim=-1
+            )
+            step_log_prob = step_log_probs.gather(
+                1, next_token.unsqueeze(-1)
+            ).squeeze(-1)
+
+            log_probs_list.append(step_log_prob)
+
+            # Append next token to sequence
+            sequence = torch.cat(
+                [sequence, next_token.unsqueeze(-1)], dim=1
+            )
+
+            # Check for EOS
+            if next_token.item() == self.eos_token:
                 break
 
-            # Get logits only for active sequences
-            active_indices = active_mask.nonzero(
-                as_tuple=True
-            )[0]
-            active_sequences = sequences[active_indices]
-            active_logits = self.get_logits(
-                active_sequences
-            )
+        # Create log probabilities that match sequence length
+        seq_len = sequence.shape[1]
+        log_probs = torch.zeros(1, seq_len, device=device)
 
-            # Sample next tokens for active sequences only
-            active_next_tokens = sample_tokens(
-                active_logits, temperature, top_k, top_p
-            )
-
-            # Calculate log probabilities for active sequences
-            active_step_log_probs = torch.log_softmax(
-                active_logits, dim=-1
-            )
-            active_step_log_probs = (
-                active_step_log_probs.gather(
-                    1, active_next_tokens.unsqueeze(-1)
-                ).squeeze(-1)
-            )
-
-            # Create full-size tensors for all sequences
-            next_tokens = torch.zeros(
-                batch_size, device=device, dtype=torch.long
-            )
-            step_log_probs = torch.zeros(
-                batch_size, device=device
-            )
-
-            # Fill in values for active sequences
-            next_tokens[active_indices] = active_next_tokens
-            step_log_probs[active_indices] = (
-                active_step_log_probs
-            )
-
-            log_probs_list.append(step_log_probs)
-
-            # Check for EOS tokens before appending
-            eos_mask = next_tokens == self.eos_token
-
-            # For sequences that hit EOS, use EOS token; for others, use sampled tokens
-            next_tokens = torch.where(
-                eos_mask,
-                torch.full_like(
-                    next_tokens, self.eos_token
-                ),
-                next_tokens,
-            )
-
-            # Append next tokens to sequences
-            sequences = torch.cat(
-                [sequences, next_tokens.unsqueeze(-1)],
-                dim=1,
-            )
-
-            # Update active mask (sequences that hit EOS become inactive)
-            active_mask = active_mask & (~eos_mask)
-
-        # Stack log probabilities: (batch_size, num_actions)
+        # Fill in log probabilities for response tokens (after prompt)
         if log_probs_list:
-            log_probs = torch.stack(
+            response_log_probs = torch.stack(
                 log_probs_list, dim=1
-            )  # (batch_size, num_actions)
-        else:
-            log_probs = torch.zeros(
-                batch_size, 0, device=device
-            )
+            )  # (1, num_response_tokens)
+            log_probs[
+                0,
+                prompt_len : prompt_len
+                + len(log_probs_list),
+            ] = response_log_probs[0]
 
-        # Pad sequences to max_response_length if needed
-        current_seq_len = sequences.shape[1]
-        max_total_length = prompt_len + max_response_length
-        if current_seq_len < max_total_length:
-            # Pad with EOS tokens (or a special padding token)
-            padding_length = (
-                max_total_length - current_seq_len
-            )
-            padding_tokens = torch.full(
-                (batch_size, padding_length),
-                self.eos_token,
-                device=device,
-                dtype=sequences.dtype,
-            )
-            sequences = torch.cat(
-                [sequences, padding_tokens], dim=1
-            )
-
-        # Create action mask: 1 for actions, 0 for prompts and padding
+        # Create action mask
         action_mask = torch.zeros_like(
-            sequences, dtype=torch.float
+            sequence, dtype=torch.int
+        )
+        action_mask[0, prompt_len:] = (
+            1  # Mark all generated tokens as actions
         )
 
-        # Mark generated tokens as actions, but stop at EOS
-        for i in range(batch_size):
-            # Find the first EOS token in the generated part
-            generated_part = sequences[i, prompt_len:]
-            eos_positions = (
-                generated_part == self.eos_token
-            ).nonzero(as_tuple=True)[0]
+        # Calculate values for each token position
+        values = self._calculate_values_per_token(sequence)
 
-            if len(eos_positions) > 0:
-                # Stop at the first EOS token
-                first_eos_pos = eos_positions[0].item()
-                action_mask[
-                    i,
-                    prompt_len : prompt_len
-                    + first_eos_pos
-                    + 1,
-                ] = 1.0
-            else:
-                # No EOS found, mark all generated tokens as actions
-                action_mask[i, prompt_len:] = 1.0
+        return sequence, log_probs, values, action_mask
 
-        # Calculate values
-        values = self._calculate_values(sequences)
-
-        return sequences, log_probs, values, action_mask
-
-    def get_values(
+    def _calculate_values_per_token(
         self, sequences: torch.Tensor
     ) -> torch.Tensor:
         """
-        Get value estimates from the value model.
+        Calculate values for each token position using the value model.
 
         Args:
-            sequences: Generated sequences of shape (batch_size, seq_len)
+            sequences: Generated sequences of shape (1, seq_len)
 
         Returns:
-            Value estimates of shape (batch_size,)
+            Values of shape (1, seq_len)
         """
         # Get hidden states from the value model
         hidden_states = self.value_model.get_hidden_states(
             sequences
-        )  # (batch_size, seq_len, d_model)
+        )  # (1, seq_len, d_model)
 
-        # Use the last token's hidden state for value prediction
-        last_hidden = hidden_states[
-            :, -1, :
-        ]  # (batch_size, d_model)
-
-        # Project to single scalar value
-        values = self.value_head(last_hidden).squeeze(
+        # Project to scalar values for each position
+        values = self.value_head(hidden_states).squeeze(
             -1
-        )  # (batch_size,)
+        )  # (1, seq_len)
+
         return values
-
-    def _calculate_values(
-        self, sequences: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Calculate values for sequences using the value model.
-
-        Args:
-            sequences: Generated sequences of shape (batch_size, seq_len)
-
-        Returns:
-            Values of shape (batch_size,)
-        """
-        return self.get_values(sequences)
 
     def get_action_log_probs(
         self,
@@ -354,7 +371,7 @@ class PPOModel:
             action_mask: Mask indicating action tokens of shape (batch_size, seq_len)
 
         Returns:
-            Log probabilities of shape (batch_size, num_actions)
+            Log probabilities of shape (batch_size, seq_len) - zeros for non-action positions
         """
         batch_size, seq_len = sequences.shape
 
@@ -374,59 +391,30 @@ class PPOModel:
             -1
         )  # (batch_size, seq_len-1)
 
-        # Extract only action log probs using the mask
-        action_mask_shifted = action_mask[
-            :, 1:
-        ]  # Shift mask to align with next tokens
+        # Create full-length log probabilities tensor
+        full_log_probs = torch.zeros(
+            batch_size, seq_len, device=sequences.device
+        )
+
+        # Fill in log probabilities for next tokens (shifted by 1)
+        full_log_probs[:, 1:] = all_log_probs
+
+        # Apply action mask to zero out non-action positions
         action_log_probs = (
-            all_log_probs * action_mask_shifted
+            full_log_probs * action_mask.float()
         )
 
-        # Remove non-action positions (where mask is 0)
-        action_log_probs_list = []
-        for i in range(batch_size):
-            action_positions = action_mask_shifted[i] == 1
-            if action_positions.any():
-                action_log_probs_list.append(
-                    action_log_probs[i][action_positions]
-                )
-            else:
-                action_log_probs_list.append(
-                    torch.tensor(
-                        [], device=sequences.device
-                    )
-                )
-
-        # Pad to same length
-        max_actions = max(
-            len(probs) for probs in action_log_probs_list
-        )
-        if max_actions > 0:
-            padded_log_probs = torch.zeros(
-                batch_size,
-                max_actions,
-                device=sequences.device,
-            )
-            for i, probs in enumerate(
-                action_log_probs_list
-            ):
-                if len(probs) > 0:
-                    padded_log_probs[i, : len(probs)] = (
-                        probs
-                    )
-            return padded_log_probs
-        else:
-            return torch.zeros(
-                batch_size, 0, device=sequences.device
-            )
+        return action_log_probs
 
     def train_step(
         self,
         sequences: torch.Tensor,
         old_log_probs: torch.Tensor,
-        advantages: torch.Tensor,
-        returns: torch.Tensor,
+        old_values: torch.Tensor,
         action_mask: torch.Tensor,
+        ref_log_probs: torch.Tensor,
+        reward_at_end: torch.Tensor,
+        kl_coeff: float = 0.1,
         clip_ratio: float = 0.2,
     ) -> dict:
         """
@@ -435,8 +423,11 @@ class PPOModel:
         Args:
             sequences: Generated sequences
             old_log_probs: Old log probabilities
-            advantages: Advantage estimates
-            returns: Return estimates
+            old_values: Old value estimates (per token)
+            action_mask: Action mask
+            ref_log_probs: Reference log probabilities for KL penalty
+            reward_at_end: Scalar reward at end of each sequence
+            kl_coeff: KL divergence coefficient
             clip_ratio: PPO clipping ratio
 
         Returns:
@@ -445,27 +436,33 @@ class PPOModel:
         # Policy optimization
         self.policy_optimizer.zero_grad()
 
-        # Get current log probabilities
+        # Get current log probabilities and values
         current_log_probs = self.get_action_log_probs(
             sequences, action_mask
         )
+        current_values = self._calculate_values_per_token(
+            sequences
+        )
+
+        # Calculate KL divergence and rewards using utility functions
+        kl = compute_kl(current_log_probs, ref_log_probs)
+        rewards = compute_reward(
+            reward_at_end, kl_coeff, kl, action_mask
+        )
+
+        # Calculate advantages
+        advantages = rewards - old_values
 
         # Calculate ratio
         ratio = torch.exp(current_log_probs - old_log_probs)
 
-        # Expand advantages to match action dimensions
-        num_actions = current_log_probs.shape[1]
-        advantages_expanded = advantages.unsqueeze(
-            1
-        ).expand(-1, num_actions)
-
         # PPO clipped objective
-        surr1 = ratio * advantages_expanded
+        surr1 = ratio * advantages
         surr2 = (
             torch.clamp(
                 ratio, 1 - clip_ratio, 1 + clip_ratio
             )
-            * advantages_expanded
+            * advantages
         )
         actor_loss = -torch.min(surr1, surr2).mean()
 
@@ -481,9 +478,11 @@ class PPOModel:
 
         # Value loss (MSE) - use fresh sequences to avoid double backward
         sequences_fresh = sequences.detach().clone()
-        values_fresh = self.get_values(sequences_fresh)
+        values_fresh = self._calculate_values_per_token(
+            sequences_fresh
+        )
         value_loss = torch.nn.functional.mse_loss(
-            values_fresh, returns.detach()
+            values_fresh, rewards.detach()
         )
 
         # Value backward pass
@@ -509,10 +508,12 @@ if __name__ == "__main__":
     # Create model
     model = PPOModel()
 
-    # Create prompt tokens (batch of starting sequences)
-    prompt_tokens = torch.tensor(
-        [[0, 1], [0, 2]]
-    )  # (batch_size=2, prompt_len=2)
+    # Create prompt tokens (list of starting sequences)
+    # sample some prompts
+    prompt_tokens = [
+        torch.tensor([0, 1]),  # First prompt
+        torch.tensor([0, 2]),  # Second prompt
+    ]
 
     # Generate rollout starting from prompts
     sequences, log_probs, values, action_mask = (
@@ -529,14 +530,59 @@ if __name__ == "__main__":
     print("Values:", values)
     print("Action mask:", action_mask)
 
+    # Create reference model (typically a frozen copy of the policy model)
+    ref_model = Transformer(
+        vocab_size=10,
+        d_model=8,
+        num_heads=2,
+        num_layers=2,
+        max_seq_len=10,
+    )
+    ref_model.eval()  # Set to evaluation mode
+
+    # Generate reference log probabilities using the reference model
+    # The reference model should evaluate the same sequences that the policy generated
+    with torch.no_grad():
+        # Get logits for all positions except the last (same as policy model)
+        ref_logits = ref_model(
+            sequences[:, :-1]
+        )  # (batch_size, seq_len-1, vocab_size)
+
+        # Get log probabilities for the actual next tokens (same as policy model)
+        next_tokens = sequences[
+            :, 1:
+        ]  # (batch_size, seq_len-1)
+        ref_log_probs = torch.log_softmax(
+            ref_logits, dim=-1
+        )
+        ref_all_log_probs = ref_log_probs.gather(
+            2, next_tokens.unsqueeze(-1)
+        ).squeeze(
+            -1
+        )  # (batch_size, seq_len-1)
+
+        # Create full-length log probabilities tensor (same as policy model)
+        batch_size, seq_len = sequences.shape
+        ref_full_log_probs = torch.zeros(
+            batch_size, seq_len, device=sequences.device
+        )
+        ref_log_probs[:, 1:] = ref_all_log_probs
+
+    print("Reference log probabilities:", ref_log_probs)
+
+    # Create end-of-sequence rewards (scalar per sequence)
+    reward_at_end = torch.ones(
+        sequences.size(0)
+    )  # Reward of 1.0 for each sequence
+
     # Training step
-    advantages = values - values.mean()
-    returns = values
     metrics = model.train_step(
         sequences,
         log_probs,
-        advantages,
-        returns,
+        values,
         action_mask,
+        ref_log_probs,
+        reward_at_end,
+        kl_coeff=0.1,
     )
     print("Training metrics:", metrics)
