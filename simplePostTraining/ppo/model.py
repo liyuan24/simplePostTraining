@@ -7,6 +7,7 @@ from simplePostTraining.ppo.utils import (
     compute_reward,
 )
 from simplePostTraining.ppo.dataloader import Dataloader
+from simplePostTraining.utils.utils import masked_mean
 
 
 class PPOModel:
@@ -678,7 +679,11 @@ class PPOModel:
                     )
                     * mini_advantages.detach()
                 )
-                actor_loss = -torch.min(surr1, surr2).mean()
+                actor_loss = masked_mean(
+                    -torch.min(surr1, surr2),
+                    mini_action_mask,
+                    dim=1,
+                ).mean()
 
                 # Policy backward pass
                 actor_loss.backward()
@@ -699,9 +704,12 @@ class PPOModel:
                         sequences_fresh
                     )
                 )
-                value_loss = torch.nn.functional.mse_loss(
-                    values_fresh, mini_returns.detach()
-                )
+                value_loss = masked_mean(
+                    (values_fresh - mini_returns.detach())
+                    ** 2,
+                    mini_action_mask,
+                    dim=1,
+                ).mean()
 
                 # Value backward pass
                 value_loss.backward()
