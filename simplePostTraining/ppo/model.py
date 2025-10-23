@@ -550,6 +550,9 @@ class PPOModel:
         self,
         sequences: torch.Tensor,
         action_mask: torch.Tensor,
+        normalize_reward: bool = True,
+        mean_reward: float = 0.0,
+        std_reward: float = 1.0,
     ) -> torch.Tensor:
         """
         Calculate end-of-sequence rewards for each sequence.
@@ -570,7 +573,10 @@ class PPOModel:
         reward_at_end = torch.ones(
             batch_size, device=device
         )
-
+        if normalize_reward:
+            reward_at_end = (
+                reward_at_end - mean_reward
+            ) / std_reward
         return reward_at_end
 
     def train_step(
