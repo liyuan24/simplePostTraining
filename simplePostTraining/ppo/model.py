@@ -307,6 +307,11 @@ class PPOModel:
             lambda_,
         )
 
+        # normalize advantages
+        advantages = (advantages - advantages.mean()) / (
+            advantages.std() + 1e-8
+        )
+
         return (
             padded_sequences,
             padded_log_probs,
