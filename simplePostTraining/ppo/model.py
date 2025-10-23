@@ -6,6 +6,7 @@ from simplePostTraining.ppo.utils import (
     compute_kl,
     compute_reward,
 )
+from simplePostTraining.ppo.dataloader import Dataloader
 
 
 class PPOModel:
@@ -65,6 +66,20 @@ class PPOModel:
 
         # Value head: projects to single scalar value
         self.value_head = torch.nn.Linear(d_model, 1)
+
+        # Initialize reference model for KL penalty
+        self.ref_model = Transformer(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            max_seq_len=max_seq_len,
+            dropout=0.1,
+            activation="relu",
+            is_causal=True,
+            norm_first=True,
+        )
+        self.ref_model.eval()  # Set to evaluation mode
 
         # Initialize optimizers
         self.policy_optimizer = torch.optim.Adam(
@@ -143,7 +158,11 @@ class PPOModel:
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
+        gamma: float = 0.99,
+        lambda_: float = 0.95,
     ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -159,9 +178,11 @@ class PPOModel:
             temperature: Sampling temperature
             top_k: Number of top tokens to consider (None = no filtering)
             top_p: Cumulative probability threshold (None = no filtering)
+            gamma: Discount factor for GAE
+            lambda_: GAE parameter for bias-variance tradeoff
 
         Returns:
-            Tuple of (sequences, log_probs, values, action_mask)
+            Tuple of (sequences, log_probs, values, action_mask, advantages, returns)
         """
         device = next(self.policy.parameters()).device
         batch_size = len(prompt_tokens)
@@ -237,11 +258,61 @@ class PPOModel:
             padded_log_probs[i, :seq_len] = all_log_probs[i]
             padded_values[i, :seq_len] = all_values[i]
 
+        # Calculate rewards using compute_reward method
+        # Calculate reference log probabilities using pre-initialized reference model
+        with torch.no_grad():
+            # Get reference logits for all positions except the last
+            ref_logits = self.ref_model(
+                padded_sequences[:, :-1]
+            )
+
+            # Get log probabilities for the actual next tokens
+            next_tokens = padded_sequences[:, 1:]
+            ref_log_probs = torch.log_softmax(
+                ref_logits, dim=-1
+            )
+            ref_all_log_probs = ref_log_probs.gather(
+                2, next_tokens.unsqueeze(-1)
+            ).squeeze(-1)
+
+            # Create full-length log probabilities tensor
+            ref_log_probs = torch.zeros_like(
+                padded_sequences, dtype=torch.float
+            )
+            ref_log_probs[:, 1:] = ref_all_log_probs
+
+        # Calculate end-of-sequence rewards
+        reward_at_end = self.get_reward_at_end(
+            padded_sequences, padded_action_masks
+        )
+
+        # Calculate KL divergence
+        kl = compute_kl(padded_log_probs, ref_log_probs)
+
+        # Calculate rewards using utility function
+        rewards = compute_reward(
+            reward_at_end,
+            0.1,  # kl_coeff = 0.1
+            kl,
+            padded_action_masks,
+        )
+
+        # Calculate GAE advantages and returns
+        advantages, returns = self.calculate_gae(
+            rewards,
+            padded_values,
+            padded_action_masks,
+            gamma,
+            lambda_,
+        )
+
         return (
             padded_sequences,
             padded_log_probs,
             padded_values,
             padded_action_masks,
+            advantages,
+            returns,
         )
 
     def _generate_single_rollout(
@@ -406,15 +477,109 @@ class PPOModel:
 
         return action_log_probs
 
+    def calculate_gae(
+        self,
+        rewards: torch.Tensor,
+        values: torch.Tensor,
+        action_mask: torch.Tensor,
+        gamma: float = 0.99,
+        lambda_: float = 0.95,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Calculate Generalized Advantage Estimation (GAE) and returns.
+
+        Args:
+            rewards: Per-token rewards of shape (batch_size, seq_len)
+            values: Value estimates of shape (batch_size, seq_len)
+            action_mask: Action mask indicating action positions of shape (batch_size, seq_len)
+            gamma: Discount factor for future rewards
+            lambda_: GAE parameter for bias-variance tradeoff
+
+        Returns:
+            advantages: GAE advantages of shape (batch_size, seq_len)
+            returns: Discounted returns of shape (batch_size, seq_len)
+        """
+        batch_size, seq_len = rewards.shape
+        device = rewards.device
+
+        # Initialize advantages and returns
+        advantages = torch.zeros_like(rewards)
+        returns = torch.zeros_like(rewards)
+
+        # Calculate GAE for each sequence
+        for i in range(batch_size):
+            # Get rewards, values, and action mask for this sequence
+            seq_rewards = rewards[i]  # (seq_len,)
+            seq_values = values[i]  # (seq_len,)
+            seq_action_mask = action_mask[i]  # (seq_len,)
+
+            # Find the last action position using action_mask
+            # This is where we should bootstrap the value
+            last_action_idx = (
+                seq_action_mask == 1
+            ).nonzero(as_tuple=True)[0]
+            if len(last_action_idx) > 0:
+                last_idx = last_action_idx[-1].item()
+            else:
+                last_idx = seq_len - 1
+
+            # Calculate advantages using GAE
+            gae = 0
+            for t in reversed(range(last_idx + 1)):
+                if t == last_idx:
+                    # At the last timestep, use the reward as the advantage
+                    delta = seq_rewards[t] - seq_values[t]
+                else:
+                    # For other timesteps, use the standard GAE formula
+                    delta = (
+                        seq_rewards[t]
+                        + gamma * seq_values[t + 1]
+                        - seq_values[t]
+                    )
+
+                gae = delta + gamma * lambda_ * gae
+                advantages[i, t] = gae
+                returns[i, t] = (
+                    seq_rewards[t] + seq_values[t]
+                )
+
+        return advantages, returns
+
+    def get_reward_at_end(
+        self,
+        sequences: torch.Tensor,
+        action_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Calculate end-of-sequence rewards for each sequence.
+
+        Args:
+            sequences: Generated sequences of shape (batch_size, seq_len)
+            action_mask: Action mask of shape (batch_size, seq_len)
+
+        Returns:
+            reward_at_end: Scalar reward for each sequence of shape (batch_size,)
+        """
+        batch_size = sequences.size(0)
+        device = sequences.device
+
+        # For now, return 1.0 for every sequence
+        # In practice, this would be calculated based on sequence quality,
+        # task completion, or other reward criteria
+        reward_at_end = torch.ones(
+            batch_size, device=device
+        )
+
+        return reward_at_end
+
     def train_step(
         self,
         sequences: torch.Tensor,
         old_log_probs: torch.Tensor,
-        old_values: torch.Tensor,
         action_mask: torch.Tensor,
-        ref_log_probs: torch.Tensor,
-        reward_at_end: torch.Tensor,
-        kl_coeff: float = 0.1,
+        advantages: torch.Tensor,
+        returns: torch.Tensor,
+        num_epochs: int = 1,
         clip_ratio: float = 0.2,
     ) -> dict:
         """
@@ -423,106 +588,113 @@ class PPOModel:
         Args:
             sequences: Generated sequences
             old_log_probs: Old log probabilities
-            old_values: Old value estimates (per token)
             action_mask: Action mask
-            ref_log_probs: Reference log probabilities for KL penalty
-            reward_at_end: Scalar reward at end of each sequence
-            kl_coeff: KL divergence coefficient
+            advantages: GAE advantages from rollout generation
+            returns: GAE returns from rollout generation
+            num_epochs: Number of training epochs
             clip_ratio: PPO clipping ratio
 
         Returns:
             Dictionary with training metrics
         """
-        # Policy optimization
-        self.policy_optimizer.zero_grad()
+        # Initialize metrics storage
+        total_actor_loss = 0.0
+        total_value_loss = 0.0
+        total_ratio_mean = 0.0
+        total_ratio_std = 0.0
 
-        # Get current log probabilities and values
-        current_log_probs = self.get_action_log_probs(
-            sequences, action_mask
-        )
-        current_values = self._calculate_values_per_token(
-            sequences
-        )
+        # Training loop for multiple epochs
+        for epoch in range(num_epochs):
+            # Policy optimization
+            self.policy_optimizer.zero_grad()
 
-        # Calculate KL divergence and rewards using utility functions
-        kl = compute_kl(current_log_probs, ref_log_probs)
-        rewards = compute_reward(
-            reward_at_end, kl_coeff, kl, action_mask
-        )
-
-        # Calculate advantages
-        advantages = rewards - old_values
-
-        # Calculate ratio
-        ratio = torch.exp(current_log_probs - old_log_probs)
-
-        # PPO clipped objective
-        surr1 = ratio * advantages
-        surr2 = (
-            torch.clamp(
-                ratio, 1 - clip_ratio, 1 + clip_ratio
+            # Get current log probabilities and values
+            current_log_probs = self.get_action_log_probs(
+                sequences, action_mask
             )
-            * advantages
-        )
-        actor_loss = -torch.min(surr1, surr2).mean()
 
-        # Policy backward pass
-        actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            self.policy.parameters(), max_norm=1.0
-        )
-        self.policy_optimizer.step()
+            # Calculate ratio
+            ratio = torch.exp(
+                current_log_probs - old_log_probs.detach()
+            )
 
-        # Value optimization
-        self.value_optimizer.zero_grad()
+            # PPO clipped objective
+            surr1 = ratio * advantages.detach()
+            surr2 = (
+                torch.clamp(
+                    ratio, 1 - clip_ratio, 1 + clip_ratio
+                )
+                * advantages.detach()
+            )
+            actor_loss = -torch.min(surr1, surr2).mean()
 
-        # Value loss (MSE) - use fresh sequences to avoid double backward
-        sequences_fresh = sequences.detach().clone()
-        values_fresh = self._calculate_values_per_token(
-            sequences_fresh
-        )
-        value_loss = torch.nn.functional.mse_loss(
-            values_fresh, rewards.detach()
-        )
+            # Policy backward pass
+            actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.policy.parameters(), max_norm=1.0
+            )
+            self.policy_optimizer.step()
 
-        # Value backward pass
-        value_loss.backward()
-        value_params = list(
-            self.value_model.parameters()
-        ) + list(self.value_head.parameters())
-        torch.nn.utils.clip_grad_norm_(
-            value_params, max_norm=1.0
-        )
-        self.value_optimizer.step()
+            # Value optimization
+            self.value_optimizer.zero_grad()
 
+            # Value loss (MSE) - use fresh sequences to avoid double backward
+            sequences_fresh = sequences.detach().clone()
+            values_fresh = self._calculate_values_per_token(
+                sequences_fresh
+            )
+            value_loss = torch.nn.functional.mse_loss(
+                values_fresh, returns.detach()
+            )
+
+            # Value backward pass
+            value_loss.backward()
+            value_params = list(
+                self.value_model.parameters()
+            ) + list(self.value_head.parameters())
+            torch.nn.utils.clip_grad_norm_(
+                value_params, max_norm=1.0
+            )
+            self.value_optimizer.step()
+
+            # Accumulate metrics
+            total_actor_loss += actor_loss.item()
+            total_value_loss += value_loss.item()
+            total_ratio_mean += ratio.mean().item()
+            total_ratio_std += ratio.std().item()
+
+        # Return average metrics across epochs
         return {
-            "actor_loss": actor_loss.item(),
-            "value_loss": value_loss.item(),
-            "ratio_mean": ratio.mean().item(),
-            "ratio_std": ratio.std().item(),
+            "actor_loss": total_actor_loss / num_epochs,
+            "value_loss": total_value_loss / num_epochs,
+            "ratio_mean": total_ratio_mean / num_epochs,
+            "ratio_std": total_ratio_std / num_epochs,
         }
 
 
 # Example usage
 if __name__ == "__main__":
-    # Create model
+    # Create model and dataloader
     model = PPOModel()
+    dataloader = Dataloader()
 
-    # Create prompt tokens (list of starting sequences)
-    # sample some prompts
-    prompt_tokens = [
-        torch.tensor([0, 1]),  # First prompt
-        torch.tensor([0, 2]),  # Second prompt
-    ]
+    prompt_tokens = dataloader.sample_prompts()
 
     # Generate rollout starting from prompts
-    sequences, log_probs, values, action_mask = (
-        model.generate_rollout(
-            prompt_tokens=prompt_tokens,
-            max_response_length=4,  # Maximum response length (excluding prompt)
-            temperature=0.8,
-            top_k=5,
-        )
+    (
+        sequences,
+        log_probs,
+        values,
+        action_mask,
+        advantages,
+        returns,
+    ) = model.generate_rollout(
+        prompt_tokens=prompt_tokens,
+        max_response_length=4,  # Maximum response length (excluding prompt)
+        temperature=0.8,
+        top_k=5,
+        gamma=0.99,
+        lambda_=0.95,
     )
     print("Prompt tokens:", prompt_tokens)
     print("Generated sequences:", sequences)
@@ -530,59 +702,13 @@ if __name__ == "__main__":
     print("Values:", values)
     print("Action mask:", action_mask)
 
-    # Create reference model (typically a frozen copy of the policy model)
-    ref_model = Transformer(
-        vocab_size=10,
-        d_model=8,
-        num_heads=2,
-        num_layers=2,
-        max_seq_len=10,
-    )
-    ref_model.eval()  # Set to evaluation mode
-
-    # Generate reference log probabilities using the reference model
-    # The reference model should evaluate the same sequences that the policy generated
-    with torch.no_grad():
-        # Get logits for all positions except the last (same as policy model)
-        ref_logits = ref_model(
-            sequences[:, :-1]
-        )  # (batch_size, seq_len-1, vocab_size)
-
-        # Get log probabilities for the actual next tokens (same as policy model)
-        next_tokens = sequences[
-            :, 1:
-        ]  # (batch_size, seq_len-1)
-        ref_log_probs = torch.log_softmax(
-            ref_logits, dim=-1
-        )
-        ref_all_log_probs = ref_log_probs.gather(
-            2, next_tokens.unsqueeze(-1)
-        ).squeeze(
-            -1
-        )  # (batch_size, seq_len-1)
-
-        # Create full-length log probabilities tensor (same as policy model)
-        batch_size, seq_len = sequences.shape
-        ref_full_log_probs = torch.zeros(
-            batch_size, seq_len, device=sequences.device
-        )
-        ref_log_probs[:, 1:] = ref_all_log_probs
-
-    print("Reference log probabilities:", ref_log_probs)
-
-    # Create end-of-sequence rewards (scalar per sequence)
-    reward_at_end = torch.ones(
-        sequences.size(0)
-    )  # Reward of 1.0 for each sequence
-
-    # Training step
+    # Training step with single epoch (default)
     metrics = model.train_step(
         sequences,
         log_probs,
-        values,
         action_mask,
-        ref_log_probs,
-        reward_at_end,
-        kl_coeff=0.1,
+        advantages,
+        returns,
+        num_epochs=2,
     )
     print("Training metrics:", metrics)
