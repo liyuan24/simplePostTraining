@@ -581,9 +581,10 @@ class PPOModel:
         returns: torch.Tensor,
         num_epochs: int = 1,
         clip_ratio: float = 0.2,
+        mini_batch_size: int = 1,
     ) -> dict:
         """
-        Perform one PPO training step.
+        Perform one PPO training step with shuffling and mini-batch processing.
 
         Args:
             sequences: Generated sequences
@@ -593,6 +594,7 @@ class PPOModel:
             returns: GAE returns from rollout generation
             num_epochs: Number of training epochs
             clip_ratio: PPO clipping ratio
+            mini_batch_size: Size of mini-batches for training
 
         Returns:
             Dictionary with training metrics
@@ -603,65 +605,146 @@ class PPOModel:
         total_ratio_mean = 0.0
         total_ratio_std = 0.0
 
+        batch_size = sequences.size(0)
+        device = sequences.device
+
         # Training loop for multiple epochs
         for epoch in range(num_epochs):
-            # Policy optimization
-            self.policy_optimizer.zero_grad()
-
-            # Get current log probabilities and values
-            current_log_probs = self.get_action_log_probs(
-                sequences, action_mask
+            # Shuffle the indices at the start of each epoch
+            indices = torch.randperm(
+                batch_size, device=device
             )
+            shuffled_sequences = sequences[indices]
+            shuffled_old_log_probs = old_log_probs[indices]
+            shuffled_action_mask = action_mask[indices]
+            shuffled_advantages = advantages[indices]
+            shuffled_returns = returns[indices]
 
-            # Calculate ratio
-            ratio = torch.exp(
-                current_log_probs - old_log_probs.detach()
-            )
+            # Process in mini-batches
+            num_mini_batches = (
+                batch_size + mini_batch_size - 1
+            ) // mini_batch_size
+            epoch_actor_loss = 0.0
+            epoch_value_loss = 0.0
+            epoch_ratio_mean = 0.0
+            epoch_ratio_std = 0.0
 
-            # PPO clipped objective
-            surr1 = ratio * advantages.detach()
-            surr2 = (
-                torch.clamp(
-                    ratio, 1 - clip_ratio, 1 + clip_ratio
+            for mini_batch_idx in range(num_mini_batches):
+                start_idx = mini_batch_idx * mini_batch_size
+                end_idx = min(
+                    start_idx + mini_batch_size, batch_size
                 )
-                * advantages.detach()
-            )
-            actor_loss = -torch.min(surr1, surr2).mean()
 
-            # Policy backward pass
-            actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                self.policy.parameters(), max_norm=1.0
-            )
-            self.policy_optimizer.step()
+                # Get mini-batch data
+                mini_sequences = shuffled_sequences[
+                    start_idx:end_idx
+                ]
+                mini_old_log_probs = shuffled_old_log_probs[
+                    start_idx:end_idx
+                ]
+                mini_action_mask = shuffled_action_mask[
+                    start_idx:end_idx
+                ]
+                mini_advantages = shuffled_advantages[
+                    start_idx:end_idx
+                ]
+                mini_returns = shuffled_returns[
+                    start_idx:end_idx
+                ]
 
-            # Value optimization
-            self.value_optimizer.zero_grad()
+                # Policy optimization
+                self.policy_optimizer.zero_grad()
 
-            # Value loss (MSE) - use fresh sequences to avoid double backward
-            sequences_fresh = sequences.detach().clone()
-            values_fresh = self._calculate_values_per_token(
-                sequences_fresh
-            )
-            value_loss = torch.nn.functional.mse_loss(
-                values_fresh, returns.detach()
-            )
+                # Get current log probabilities and values
+                current_log_probs = (
+                    self.get_action_log_probs(
+                        mini_sequences, mini_action_mask
+                    )
+                )
 
-            # Value backward pass
-            value_loss.backward()
-            value_params = list(
-                self.value_model.parameters()
-            ) + list(self.value_head.parameters())
-            torch.nn.utils.clip_grad_norm_(
-                value_params, max_norm=1.0
-            )
-            self.value_optimizer.step()
+                # Calculate ratio
+                ratio = torch.exp(
+                    current_log_probs
+                    - mini_old_log_probs.detach()
+                )
 
-            # Accumulate metrics
-            total_actor_loss += actor_loss.item()
-            total_value_loss += value_loss.item()
-            total_ratio_mean += ratio.mean().item()
-            total_ratio_std += ratio.std().item()
+                # PPO clipped objective
+                surr1 = ratio * mini_advantages.detach()
+                surr2 = (
+                    torch.clamp(
+                        ratio,
+                        1 - clip_ratio,
+                        1 + clip_ratio,
+                    )
+                    * mini_advantages.detach()
+                )
+                actor_loss = -torch.min(surr1, surr2).mean()
+
+                # Policy backward pass
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.policy.parameters(), max_norm=1.0
+                )
+                self.policy_optimizer.step()
+
+                # Value optimization
+                self.value_optimizer.zero_grad()
+
+                # Value loss (MSE) - use fresh sequences to avoid double backward
+                sequences_fresh = (
+                    mini_sequences.detach().clone()
+                )
+                values_fresh = (
+                    self._calculate_values_per_token(
+                        sequences_fresh
+                    )
+                )
+                value_loss = torch.nn.functional.mse_loss(
+                    values_fresh, mini_returns.detach()
+                )
+
+                # Value backward pass
+                value_loss.backward()
+                value_params = list(
+                    self.value_model.parameters()
+                ) + list(self.value_head.parameters())
+                torch.nn.utils.clip_grad_norm_(
+                    value_params, max_norm=1.0
+                )
+                self.value_optimizer.step()
+
+                # Accumulate mini-batch metrics
+                mini_batch_size_actual = (
+                    mini_sequences.size(0)
+                )
+                epoch_actor_loss += (
+                    actor_loss.item()
+                    * mini_batch_size_actual
+                )
+                epoch_value_loss += (
+                    value_loss.item()
+                    * mini_batch_size_actual
+                )
+                epoch_ratio_mean += (
+                    ratio.mean().item()
+                    * mini_batch_size_actual
+                )
+                epoch_ratio_std += (
+                    ratio.std().item()
+                    * mini_batch_size_actual
+                )
+
+            # Average metrics for this epoch
+            epoch_actor_loss /= batch_size
+            epoch_value_loss /= batch_size
+            epoch_ratio_mean /= batch_size
+            epoch_ratio_std /= batch_size
+
+            # Accumulate epoch metrics
+            total_actor_loss += epoch_actor_loss
+            total_value_loss += epoch_value_loss
+            total_ratio_mean += epoch_ratio_mean
+            total_ratio_std += epoch_ratio_std
 
         # Return average metrics across epochs
         return {
@@ -702,7 +785,7 @@ if __name__ == "__main__":
     print("Values:", values)
     print("Action mask:", action_mask)
 
-    # Training step with single epoch (default)
+    # Training step with mini-batch processing
     metrics = model.train_step(
         sequences,
         log_probs,
@@ -710,5 +793,6 @@ if __name__ == "__main__":
         advantages,
         returns,
         num_epochs=2,
+        mini_batch_size=1,  # Process one sequence at a time
     )
     print("Training metrics:", metrics)
