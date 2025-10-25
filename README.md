@@ -2,7 +2,7 @@
 a simple library for post training
 
 # TODO
-- [ ] value function clipping and value loss coefficient
+- [x] ~~value function clipping and value loss coefficient~~
 - [ ] Preprocess summary from human feedback dataset
 - [ ] Explore the SFT right padding
 - [ ] Explore the Reward model training right padding
