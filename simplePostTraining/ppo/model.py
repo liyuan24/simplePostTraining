@@ -591,8 +591,11 @@ class PPOModel:
         action_mask: torch.Tensor,
         advantages: torch.Tensor,
         returns: torch.Tensor,
+        old_values: torch.Tensor,
         num_epochs: int = 1,
         clip_ratio: float = 0.2,
+        value_clip_range: float = 0.4,
+        value_loss_coefficient: float = 0.5,
         mini_batch_size: int = 1,
     ) -> dict:
         """
@@ -604,8 +607,10 @@ class PPOModel:
             action_mask: Action mask
             advantages: GAE advantages from rollout generation
             returns: GAE returns from rollout generation
+            old_values: Old values from the value model
             num_epochs: Number of training epochs
             clip_ratio: PPO clipping ratio
+            value_clip_range: Value function clipping range
             mini_batch_size: Size of mini-batches for training
 
         Returns:
@@ -640,6 +645,7 @@ class PPOModel:
             epoch_value_loss = 0.0
             epoch_ratio_mean = 0.0
             epoch_ratio_std = 0.0
+            epoch_loss = 0.0
 
             for mini_batch_idx in range(num_mini_batches):
                 start_idx = mini_batch_idx * mini_batch_size
@@ -664,9 +670,6 @@ class PPOModel:
                     start_idx:end_idx
                 ]
 
-                # Policy optimization
-                self.policy_optimizer.zero_grad()
-
                 # Get current log probabilities and values
                 current_log_probs = (
                     self.get_action_log_probs(
@@ -690,22 +693,12 @@ class PPOModel:
                     )
                     * mini_advantages.detach()
                 )
+
                 actor_loss = masked_mean(
                     -torch.min(surr1, surr2),
                     mini_action_mask,
                     dim=1,
                 ).mean()
-
-                # Policy backward pass
-                actor_loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    self.policy.parameters(), max_norm=1.0
-                )
-                self.policy_optimizer.step()
-
-                # Value optimization
-                self.value_optimizer.zero_grad()
-
                 # Value loss (MSE) - use fresh sequences to avoid double backward
                 sequences_fresh = (
                     mini_sequences.detach().clone()
@@ -715,21 +708,44 @@ class PPOModel:
                         sequences_fresh
                     )
                 )
-                value_loss = masked_mean(
+                values_clipped = (
+                    old_values.detach()
+                    + torch.clamp(
+                        values_fresh - old_values.detach(),
+                        -value_clip_range,
+                        value_clip_range,
+                    )
+                )
+                value_loss = torch.max(
                     (values_fresh - mini_returns.detach())
                     ** 2,
+                    (values_clipped - mini_returns.detach())
+                    ** 2,
+                )
+                value_loss = masked_mean(
+                    value_loss,
                     mini_action_mask,
                     dim=1,
                 ).mean()
 
+                self.policy_optimizer.zero_grad()
+                self.value_optimizer.zero_grad()
+                loss = (
+                    actor_loss
+                    + value_loss_coefficient * value_loss
+                )
                 # Value backward pass
-                value_loss.backward()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.policy.parameters(), max_norm=1.0
+                )
                 value_params = list(
                     self.value_model.parameters()
                 ) + list(self.value_head.parameters())
                 torch.nn.utils.clip_grad_norm_(
                     value_params, max_norm=1.0
                 )
+                self.policy_optimizer.step()
                 self.value_optimizer.step()
 
                 # Accumulate mini-batch metrics
@@ -752,25 +768,24 @@ class PPOModel:
                     ratio.std().item()
                     * mini_batch_size_actual
                 )
+                epoch_loss += (
+                    loss.item() * mini_batch_size_actual
+                )
 
             # Average metrics for this epoch
             epoch_actor_loss /= batch_size
             epoch_value_loss /= batch_size
+            epoch_loss /= batch_size
             epoch_ratio_mean /= batch_size
             epoch_ratio_std /= batch_size
+            epoch_loss /= batch_size
 
-            # Accumulate epoch metrics
-            total_actor_loss += epoch_actor_loss
-            total_value_loss += epoch_value_loss
-            total_ratio_mean += epoch_ratio_mean
-            total_ratio_std += epoch_ratio_std
-
-        # Return average metrics across epochs
         return {
-            "actor_loss": total_actor_loss / num_epochs,
-            "value_loss": total_value_loss / num_epochs,
-            "ratio_mean": total_ratio_mean / num_epochs,
-            "ratio_std": total_ratio_std / num_epochs,
+            "actor_loss": epoch_actor_loss,
+            "value_loss": epoch_value_loss,
+            "ratio_mean": epoch_ratio_mean,
+            "ratio_std": epoch_ratio_std,
+            "loss": epoch_loss,
         }
 
 
@@ -811,6 +826,7 @@ if __name__ == "__main__":
         action_mask,
         advantages,
         returns,
+        values,
         num_epochs=2,
         mini_batch_size=1,  # Process one sequence at a time
     )
